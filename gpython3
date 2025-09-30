@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# This is a launcher script to start Python such that it loads GNUCash Python
+# bindings correctly.
+#
+# ./gpython3 my_script.py
+#
+
+# this should point to the GNC install root that you specified as cmake
+# INSTALL_PREFIX when compiling GNUCash.
+GNC_INSTALL_PATH=$HOME/gnc
+
+# set this to whatever your Python version that was used when generating Python
+# bindings.
+PYTHON_VER=3.12
+
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+
+# Point to the system libstdc++ that matches your build
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+
+# Optionally also adjust PYTHONPATH if needed.
+export PYTHONPATH=${GNC_INSTALL_PATH}/lib/python${PYTHON_VER}/site-packages:$PYTHONPATH
+
+# Run Python with whatever arguments you pass
+nice python "$@"
+
