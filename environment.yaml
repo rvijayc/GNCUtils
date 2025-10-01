@@ -7,4 +7,9 @@ dependencies:
   - ipython
   - tabulate
   - pyyaml
+  - langgraph 
+  - langchain-openai 
+  - langchain-community 
+  - tavily-python
+  - langchain-tavily
 

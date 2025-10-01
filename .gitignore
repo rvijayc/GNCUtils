@@ -1,2 +1,6 @@
+__pycache__/
+*.qfx
+*.ofx
 categorization_rules.json
 *.gnucash
+*.log
