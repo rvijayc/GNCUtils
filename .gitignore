@@ -1,3 +1,5 @@
+*.json
+*.yaml
 __pycache__/
 *.qfx
 *.ofx

@@ -1,533 +1,679 @@
 #!/usr/bin/env python3
 """
-LLM-based Transaction Categorizer with Internet Search
-Uses LangGraph to create a REACT agent that categorizes transactions intelligently
+LLM-based Transaction Categorizer - Transaction-Based Architecture
+
+Integrated workflow:
+1. Rules Engine: Check manual/history/AI rules first (works with Transaction objects)
+2. Credit Filter: Auto-return "Unspecified" for credit transactions
+3. Phase 1 LLM: Try categorization using LLM knowledge (generates regex)
+4. Phase 2 LLM: Fall back to internet search if uncertain
+5. Updates Transaction.categorization field with CategorizationResult
+
+Integrates with:
+- rules_engine.py for priority-based rule matching (Transaction-based)
+- core_models.py for Transaction and CategorizationResult dataclasses
+- rules_db.py for AI rules caching
+- category_extractor.py for valid categories
+- description_normalizer.py for consistent normalization
+
+Architecture:
+- Works with Transaction objects (not primitive strings)
+- Populates transaction.categorization field with CategorizationResult
+- Maintains separation between transaction facts and categorization state
 """
 
 import sys
 import json
 import argparse
 import os
-from typing import Dict, List, Optional, TypedDict, Annotated
+from typing import Dict, List, Optional, TypedDict
 from datetime import datetime
 from pathlib import Path
-import re
-import pdb
 
 from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 
 from rich.table import Table
 from rich.console import Console
+from rich.progress import Progress
 
-class AgentState(TypedDict):
-    """State for the categorization agent"""
-    transaction_description: str
-    extracted_merchant: str
+from core_models import (
+    CategorizationRule,
+    CategorizationResult,
+    RuleType,
+    RuleSource,
+    Transaction,
+    TransactionType
+)
+from rules_db import save_history_rules
+from description_normalizer import normalize_description
+from rules_engine import RulesEngine, RuleMatchResult
+
+
+class AgentState(TypedDict, total=False):
+    """State for the categorization agent with static typing."""
+    normalized_description: str
+    original_description: str
+    category: str
+    merchant: str
+    regex: str  # Generated regex pattern for matching similar transactions
+    confidence: float
+    needs_search: bool
     search_results: str
     reasoning: str
-    category: str
-    confidence: float
-    explanation: str
-    messages: Annotated[List, "Messages in the conversation"]
+    phase: str
 
 
 class LLMTransactionCategorizer:
-    """LLM-based transaction categorizer with internet search capability"""
-    
-    def __init__(self, openai_api_key: str = None, tavily_api_key: str = None):
+    """
+    LLM-based transaction categorizer with rules engine integration.
+
+    Workflow:
+    1. Check rules engine (manual/history/AI rules)
+    2. If no match, run two-phase LLM categorization
+    3. Cache results in ai_rules.yaml
+    """
+
+    def __init__(
+        self,
+        openai_api_key: Optional[str] = None,
+        tavily_api_key: Optional[str] = None,
+        categories_file: Optional[str] = None,
+        rules_engine: Optional[RulesEngine] = None,
+        ai_rules_file: str = "ai_rules.yaml"
+    ):
+        """
+        Initialize LLM categorizer with rules engine.
+
+        Args:
+            openai_api_key: OpenAI API key
+            tavily_api_key: Tavily API key (optional, for Phase 2)
+            categories_file: JSON file with valid categories
+            rules_engine: Pre-configured rules engine (or creates default)
+            ai_rules_file: YAML file for caching AI-generated rules
+        """
         # Initialize API keys
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.tavily_api_key = tavily_api_key or os.getenv("TAVILY_API_KEY")
-        
+
         if not self.openai_api_key:
-            raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable or pass as parameter.")
-        
+            raise ValueError("OpenAI API key required.")
+
         if not self.tavily_api_key:
-            raise ValueError("Tavily API key required. Set TAVILY_API_KEY environment variable or pass as parameter.")
-        
-        # Initialize LLM and tools
+            print("Warning: Tavily API key not found. Phase 2 search will be disabled.")
+            self.search_enabled = False
+        else:
+            self.search_enabled = True
+
+        # Initialize LLM
         self.llm = ChatOpenAI(
-                api_key=self.openai_api_key,  # pyright: ignore[reportArgumentType]
-                model="gpt-4o-mini",  # Cost-effective model
-                temperature=0.1  # Low temperature for consistent categorization
+            api_key=self.openai_api_key,
+            model="gpt-4o-mini",
+            temperature=0.1
         )
 
-        # Initialize
-        self.search_tool = TavilySearch(
-            api_key=self.tavily_api_key,
-            max_results=3,
-            search_depth="basic"
-        )
-        
-        # Create the agent graph
+        # Initialize search tool
+        if self.search_enabled:
+            self.search_tool = TavilySearch(
+                api_key=self.tavily_api_key,
+                max_results=3,
+                search_depth="basic"
+            )
+        else:
+            self.search_tool = None
+
+        # Load categories
+        self.categories = self._load_categories(categories_file)
+
+        # Initialize or use provided rules engine
+        self.rules_engine = rules_engine or RulesEngine()
+
+        # AI rules cache (for updating)
+        self.ai_rules_file = ai_rules_file
+        self.new_ai_rules: List[CategorizationRule] = []
+
+        # Statistics
+        self.stats = {
+            'rules_engine_hits': 0,
+            'phase1_success': 0,
+            'phase2_search': 0,
+            'total_processed': 0
+        }
+
+        # Create LangGraph agent
         self.agent = self._create_agent()
-        
-        # Actual GNUCash categories from user's file
-        self.common_categories = [
-            "Expenses:Automobile",
-            "Expenses:Automobile:Maintenance",
-            "Expenses:Automobile:Rental",
-            "Expenses:Automobile:Parking",
-            "Expenses:Automobile:Gasoline",
-            "Expenses:Automobile:Car Payment",
-            "Expenses:Automobile:Taxes",
-            "Expenses:Automobile:Upgrades",
-            "Expenses:Automobile:Accessories",
-            "Expenses:Bank Charges",
-            "Expenses:Bank Charges:Interest Paid",
-            "Expenses:Bank Charges:Fees",
-            "Expenses:Bank Charges:Service Charge",
-            "Expenses:Bills",
-            "Expenses:Bills:Rent",
-            "Expenses:Bills:Telephone",
-            "Expenses:Bills:Cable-Satellite Television",
-            "Expenses:Bills:Health Club",
-            "Expenses:Bills:Electricity",
-            "Expenses:Bills:Cellular",
-            "Expenses:Bills:Water & Sewer",
-            "Expenses:Bills:Other Loan Payment",
-            "Expenses:Bills:Membership Fees",
-            "Expenses:Bills:Common Fund",
-            "Expenses:Bills:Online-Internet Service",
-            "Expenses:Bills:Natural Gas-Oil",
-            "Expenses:Bills:Homeowner's Dues",
-            "Expenses:Bills:Commute",
-            "Expenses:Bills:Garbage & Recycle",
-            "Expenses:Bills:Home Security",
-            "Expenses:Bills:Yard Maintenance",
-            "Expenses:Bills:Streaming Services",
-            "Expenses:Charitable Donations",
-            "Expenses:Charitable Donations:Political Donations",
-            "Expenses:Childcare",
-            "Expenses:Cash Withdrawal",
-            "Expenses:Cash Withdrawal:Miscellaneous Expenses",
-            "Expenses:Cash Withdrawal:Cash Expeditures",
-            "Expenses:Clothing",
-            "Expenses:Clothing:Casual",
-            "Expenses:Clothing:Formal",
-            "Expenses:Clothing:Makeup",
-            "Expenses:Clothing:Jewellery",
-            "Expenses:Dining Out",
-            "Expenses:Education",
-            "Expenses:Education:Miscellaneous",
-            "Expenses:Education:Fees",
-            "Expenses:Education:Books",
-            "Expenses:Education:Tuition",
-            "Expenses:Education:Kids Classes",
-            "Expenses:Electronics",
-            "Expenses:Electronics:Gadgets",
-            "Expenses:Electronics:Games",
-            "Expenses:Electronics:Accesories",
-            "Expenses:Electronics:Computers",
-            "Expenses:Gifts",
-            "Expenses:Gifts:General",
-            "Expenses:Gifts:To India",
-            "Expenses:Groceries",
-            "Expenses:Groceries:Membership",
-            "Expenses:Healthcare",
-            "Expenses:Healthcare:Counter",
-            "Expenses:Healthcare:Hospital",
-            "Expenses:Healthcare:Physician",
-            "Expenses:Healthcare:Athletic Club",
-            "Expenses:Healthcare:Prescriptions",
-            "Expenses:Healthcare:Home Gym",
-            "Expenses:Healthcare:Eyecare (Before-Tax)",
-            "Expenses:Healthcare:Dental",
-            "Expenses:Healthcare:Eyecare",
-            "Expenses:Healthcare:Miscellaneous",
-            "Expenses:Household",
-            "Expenses:Household:Baby Stuff",
-            "Expenses:Household:Software",
-            "Expenses:Household:Merchandise (Chicago)",
-            "Expenses:Household:Merchandise",
-            "Expenses:Household:House Cleaning",
-            "Expenses:Insurance",
-            "Expenses:Insurance:Life",
-            "Expenses:Insurance:Umbrella",
-            "Expenses:Insurance:Health (Before-Tax)",
-            "Expenses:Insurance:Homeowner's-Renter's",
-            "Expenses:Insurance:Health",
-            "Expenses:Insurance:Automobile",
-            "Expenses:Insurance:Renters",
-            "Expenses:Insurance:Legal",
-            "Expenses:Job Expense",
-            "Expenses:Job Expense:Non-Reimbursed",
-            "Expenses:Job Expense:Reimbursed",
-            "Expenses:Leisure",
-            "Expenses:Leisure:Musical Instruments",
-            "Expenses:Leisure:Toys & Games",
-            "Expenses:Leisure:Sporting Events",
-            "Expenses:Leisure:Entertaining",
-            "Expenses:Leisure:Tapes & CDs",
-            "Expenses:Leisure:Books & Magazines",
-            "Expenses:Leisure:Cultural Events",
-            "Expenses:Leisure:Movies & Video Rentals",
-            "Expenses:Leisure:Music Subscriptions",
-            "Expenses:Leisure:Sporting Goods",
-            "Expenses:Leisure:Phone Apps",
-            "Expenses:Leisure:Music and Dance Classes",
-            "Expenses:Leisure:Concerts",
-            "Expenses:Leisure:Family Events-Parties",
-            "Expenses:Leisure:Activities",
-            "Expenses:Miscellaneous",
-            "Expenses:Miscellaneous:Adjustment",
-            "Expenses:Miscellaneous:Guest Expenses",
-            "Expenses:Miscellaneous:Unclaimed",
-            "Expenses:Miscellaneous:Depreciation",
-            "Expenses:Miscellaneous:Fines",
-            "Expenses:Miscellaneous:Unknown",
-            "Expenses:Miscellaneous:Stationery",
-            "Expenses:Miscellaneous:Tax Preparation",
-            "Expenses:Miscellaneous:Finance Software",
-            "Expenses:Miscellaneous:Family Events",
-            "Expenses:Miscellaneous:Home-Transaction-Charges",
-            "Expenses:Personal Care",
-            "Expenses:Tax",
-            "Expenses:Tax:Fed",
-            "Expenses:Tax:Medicare",
-            "Expenses:Tax:Property",
-            "Expenses:Tax:SDI",
-            "Expenses:Tax:State",
-            "Expenses:Tax:Soc Sec",
-            "Expenses:Tax:Fed-Previous Year",
-            "Expenses:Tax:State-Previous Year",
-            "Expenses:Taxes",
-            "Expenses:Taxes:State-Provincial",
-            "Expenses:Taxes:Medicare Tax",
-            "Expenses:Taxes:Other Taxes",
-            "Expenses:Taxes:Federal Income Tax",
-            "Expenses:Taxes:Sales Tax",
-            "Expenses:Taxes:Income Tax-Previous Year",
-            "Expenses:Taxes:Social Security Tax",
-            "Expenses:Taxes:State Income Tax",
-            "Expenses:Taxes:Local Income Tax",
-            "Expenses:Transportation",
-            "Expenses:Transportation:Rideshare",
-            "Expenses:Transportation:Airfare",
-            "Expenses:Vacation",
-            "Expenses:Vacation:Travel",
-            "Expenses:Vacation:Purchases",
-            "Expenses:Vacation:Lodging",
-            "Expenses:Vacation:Activities",
-            "Expenses:Vacation:Dining",
-            "Expenses:Loan Payment",
-            "Expenses:Loan Payment:Interest",
-            "Expenses:Official",
-            "Expenses:Official:Immigration",
-            "Expenses:Official:Tax Preparation",
-            "Expenses:Depreciation",
-            "Expenses:Home Related",
-            "Expenses:Home Related:Fees-Commisions",
-            "Expenses:Home Related:Furnishings",
-            "Expenses:Home Related:Moving Expenses",
-            "Expenses:Home Related:Maintenance",
-            "Expenses:Home Related:Remodel-Upgrades"
+
+    def _load_categories(self, categories_file: Optional[str]) -> List[str]:
+        """Load valid categories from JSON file."""
+        if not categories_file or not Path(categories_file).exists():
+            print("Warning: No categories file. Using defaults.")
+            return self._get_default_categories()
+
+        try:
+            with open(categories_file, 'r') as f:
+                data = json.load(f)
+                categories = data.get('categories', [])
+                print(f"Loaded {len(categories)} categories")
+                return categories
+        except Exception as e:
+            print(f"Error loading categories: {e}")
+            return self._get_default_categories()
+
+    def _get_default_categories(self) -> List[str]:
+        """Fallback default categories."""
+        return [
+            "Expenses.Dining Out",
+            "Expenses.Groceries",
+            "Expenses.Automobile.Gasoline",
+            "Unspecified"
         ]
-    
-    
+
     def _create_agent(self) -> StateGraph:
-        """Create the LangGraph agent for transaction categorization"""
-        
-        def search_transaction_info(transaction_description: str) -> str:
-            """Search for information about a transaction/business"""
-            # Create a smart search query from the transaction description
-            query = f"{transaction_description} company industry type"
-            output = self.search_tool.invoke(query)
+        """Create LangGraph agent with two-phase categorization."""
 
-            # validate outputs.
-            if not output:
-                return "No search results found."
-            results = output['results']
-            if len(results) == 0:
-                return "No search results found."
-            
-            # Combine search results
-            combined_results = []
-            for result in results[:3]:  # Top 3 results
-                if isinstance(result, dict):
-                    content = result.get('content', '')
-                    if content:
-                        combined_results.append(content[:200])  # Limit length
-        
-            return " | ".join(combined_results) if combined_results else "No relevant information found"
-                    
-        def search_node(state: AgentState) -> AgentState:
-            """Search for transaction information"""
-            description = state["transaction_description"]
-            search_result = search_transaction_info(transaction_description=description)           
-            state["search_results"] = search_result
-            state["messages"].append(ToolMessage(content=search_result, tool_call_id="search"))
-            
-            return state
-        
-        def categorize_node(state: AgentState) -> AgentState:
-            """Use LLM to categorize the transaction"""
-            
-            # Create categorization prompt
-            prompt = f"""
-You are an expert financial transaction categorizer. Your task is to categorize a transaction into the most appropriate expense category.
+        def phase1_categorize_node(state: AgentState) -> AgentState:
+            """Phase 1: Categorize using LLM knowledge, generate regex."""
+            description = state["normalized_description"]
 
-Transaction Description: {state['transaction_description']}
-Internet Search Results: {state['search_results']}
+            # Format all categories for display
+            categories_list = "\n".join([f"- {cat}" for cat in self.categories])
 
-Common Categories:
-{chr(10).join([f"- {cat}" for cat in self.common_categories])}
+            prompt = f"""You are an expert at categorizing financial transactions.
 
-Please note that if the description contains the following, it may be related to Credit Card bill payments, so use the category "Unspecified" for these and leave the merchant name empty.
+Transaction Description: {description}
 
-- INTERNET PAYMENT THANK YOU
+AVAILABLE CATEGORIES (you MUST use exactly one of these):
+{categories_list}
 
-Based on the transaction description and internet search results about the business, please:
+CRITICAL RULES:
+1. You MUST choose a category from the list above - DO NOT invent new categories
+2. Use the EXACT category name as shown (including dots and capitalization)
+3. For well-known merchants, categorize confidently
+4. Generate a regex pattern to match similar transactions (e.g., "chipotle.*" for all Chipotles)
+5. Credit card payments ("INTERNET PAYMENT") → "Unspecified"
+6. If uncertain about the merchant (< 0.7 confidence), set needs_search=true
 
-1. Determine the most appropriate category from the list above (or suggest a new one if none fit).
-2. Determine the official merchant or business name using the search results (if applicable).
-2. Provide a confidence score from 0.0 to 1.0
-3. Explain your reasoning
+MERCHANT-SPECIFIC GUIDELINES:
+- Pharmacies (CVS, Walgreens, Rite Aid): Default to "Expenses.Healthcare.Counter" (most purchases are OTC, not prescriptions)
+- Gas stations with convenience stores (7-Eleven, Circle K): If the name mentions "gas" use "Expenses.Automobile.Gasoline", otherwise use the store category
+- Multi-department stores (Costco, Target, Walmart): Cannot determine specific category - use the broadest applicable category
+- Costco Gas: Use "Expenses.Automobile.Gasoline" (not Groceries)
+- Airport transactions: Most likely parking unless explicitly airfare
 
-Please respond in the following raw JSON format:
+Respond in JSON format (NO markdown, raw JSON only):
 {{
-    "category": "Expenses:Category:Subcategory",
-    "merchant": "Any official merchant name that you identified from searching (or) empty string if not applicable or none found"
-    "description": "The input original description"
+    "category": "Expenses.Category.Subcategory",
+    "merchant": "Merchant name if identifiable",
+    "regex": "regex pattern to match similar transactions",
     "confidence": 0.95,
-    "reasoning": "Detailed explanation of why this category was chosen"
-}}
-DO NOT include backticks or any Markdown formatting on top of raw JSON content.
+    "needs_search": false,
+    "reasoning": "Brief explanation"
+}}"""
 
-Some categorization guidelines based on GNUCash structure:
-
-- Netflix, Spotify, iTunes, streaming services → "Expenses:Bills:Streaming Services"
-- Restaurants, coffee shops → "Expenses:Dining Out"
-- Gas stations → "Expenses:Automobile:Gasoline"
-- Uber, Lyft → "Expenses:Transportation:Rideshare"
-- Parking fees → "Expenses:Automobile:Parking"
-- LinkedIn, business software → "Expenses:Household:Software" 
-- Starbucks, cafes → "Expenses:Dining Out"
-- Target, Walmart → "Expenses:Household:Merchandise"
-- Costco, Vons, Amazon Fresh, Ralphs, Grocery stores → "Expenses:Groceries"
-- Health/fitness clubs → "Expenses:Bills:Health Club" 
-- Phone bills (T-Mobile, Spectrum Mobile) → "Expenses:Bills:Cellular" or "Expenses:Bills:Telephone"
-- Internet service (like Spectrum) → "Expenses:Bills:Online-Internet Service"
-- Clothing stores → "Expenses:Clothing"
-- Electronics stores → "Expenses:Electronics:Gadgets" or "Expenses:Electronics:Computers"
-
-You may use the "Unspecified" category to tag transactions that you are unable to classify using the provided categories and rules.
-"""
-            
-            # Get LLM response
             messages = [HumanMessage(content=prompt)]
             response = self.llm.invoke(messages)
-            
+
             try:
-                # Parse JSON response
-                import json
                 result = json.loads(response.content)
-                pdb.set_trace()
-                
-                state["category"] = result.get("category", "Unknown")
-                state["confidence"] = float(result.get("confidence", 0.0))
-                state["reasoning"] = result.get("reasoning", "No reasoning provided")
-                state["explanation"] = f"LLM categorized based on merchant '{state['extracted_merchant']}' and search results"
-                state["extracted_merchant"] = result.get("merchant")
-                
-            except json.JSONDecodeError:
-                # Fallback if JSON parsing fails
-                state["category"] = "Unknown"
+
+                # Validate category exists in our list
+                proposed_category = result.get("category", "Unspecified")
+                if proposed_category not in self.categories:
+                    print(f"Warning: LLM proposed invalid category '{proposed_category}', using 'Unspecified'")
+                    state["category"] = "Unspecified"
+                    state["confidence"] = 0.0
+                    state["needs_search"] = True
+                else:
+                    state["category"] = proposed_category
+                    state["confidence"] = float(result.get("confidence", 0.0))
+                    state["needs_search"] = result.get("needs_search", False)
+
+                state["merchant"] = result.get("merchant", "")
+                state["regex"] = result.get("regex", "")
+                state["reasoning"] = result.get("reasoning", "")
+                state["phase"] = "phase1"
+
+                if state["confidence"] >= 0.7 and not state["needs_search"]:
+                    self.stats['phase1_success'] += 1
+                    state["search_results"] = "Not needed"
+
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error in phase1: {e}")
+                state["category"] = "Unspecified"
                 state["confidence"] = 0.0
-                state["reasoning"] = "Failed to parse LLM response"
-                state["explanation"] = f"LLM response: {response.content}"
-                state["extracted_merchant"] = "Unknown"
-            
-            state["messages"].append(AIMessage(content=f"Categorized as: {state['category']} (confidence: {state['confidence']})"))
+                state["needs_search"] = True
+                state["regex"] = ""
+
             return state
-        
-        # Create the graph
+
+        def search_node(state: AgentState) -> AgentState:
+            """Search for transaction information."""
+            if not self.search_enabled:
+                state["search_results"] = "Search disabled"
+                return state
+
+            description = state["original_description"]
+
+            try:
+                query = f"{description} company business type"
+                output = self.search_tool.invoke(query)
+
+                if not output or not output.get('results'):
+                    state["search_results"] = "No results"
+                    return state
+
+                results = output['results']
+                combined = []
+                for r in results[:3]:
+                    if isinstance(r, dict) and r.get('content'):
+                        combined.append(r['content'][:200])
+
+                state["search_results"] = " | ".join(combined) if combined else "No info"
+                self.stats['phase2_search'] += 1
+
+            except Exception as e:
+                state["search_results"] = f"Search error: {e}"
+
+            return state
+
+        def phase2_categorize_node(state: AgentState) -> AgentState:
+            """Phase 2: Categorize with search results."""
+            description = state["normalized_description"]
+            search_results = state.get("search_results", "")
+
+            # Format all categories for display
+            categories_list = "\n".join([f"- {cat}" for cat in self.categories])
+
+            prompt = f"""Categorize this transaction using search results.
+
+Description: {description}
+Search Results: {search_results}
+
+AVAILABLE CATEGORIES (you MUST use exactly one of these):
+{categories_list}
+
+CRITICAL RULES:
+1. You MUST choose a category from the list above - DO NOT invent new categories
+2. Use the EXACT category name as shown (including dots and capitalization)
+3. Use search results to determine the correct business type
+4. Generate a regex pattern to match similar transactions
+
+MERCHANT-SPECIFIC GUIDELINES:
+- Pharmacies (CVS, Walgreens, Rite Aid): Default to "Expenses.Healthcare.Counter" (most purchases are OTC, not prescriptions)
+- Gas stations with convenience stores (7-Eleven, Circle K): If the name mentions "gas" use "Expenses.Automobile.Gasoline", otherwise use the store category
+- Multi-department stores (Costco, Target, Walmart): Cannot determine specific category - use the broadest applicable category
+- Costco Gas: Use "Expenses.Automobile.Gasoline" (not Groceries)
+- Airport transactions: Most likely parking unless explicitly airfare
+
+Respond in JSON format (NO markdown, raw JSON only):
+{{
+    "category": "Expenses.Category.Subcategory",
+    "merchant": "Official merchant name from search",
+    "regex": "regex pattern for similar transactions",
+    "confidence": 0.95,
+    "reasoning": "Detailed explanation"
+}}"""
+
+            messages = [HumanMessage(content=prompt)]
+            response = self.llm.invoke(messages)
+
+            try:
+                result = json.loads(response.content)
+
+                # Validate category exists in our list
+                proposed_category = result.get("category", "Unspecified")
+                if proposed_category not in self.categories:
+                    print(f"Warning: LLM proposed invalid category '{proposed_category}' in phase2, using 'Unspecified'")
+                    state["category"] = "Unspecified"
+                    state["confidence"] = 0.0
+                else:
+                    state["category"] = proposed_category
+                    state["confidence"] = float(result.get("confidence", 0.0))
+
+                state["merchant"] = result.get("merchant", state.get("merchant", ""))
+                state["regex"] = result.get("regex", state.get("regex", ""))
+                state["reasoning"] = result.get("reasoning", "")
+                state["phase"] = "phase2"
+
+            except json.JSONDecodeError as e:
+                print(f"JSON parse error in phase2: {e}")
+                # Keep phase1 results
+
+            return state
+
+        def should_search(state: AgentState) -> str:
+            """Decide whether to search."""
+            needs_search = state.get("needs_search", False)
+            confidence = state.get("confidence", 0.0)
+
+            if needs_search or confidence < 0.7:
+                return "search"
+            return "end"
+
+        # Build graph
         workflow = StateGraph(AgentState)
-        
-        # Add nodes
+
+        workflow.add_node("phase1_categorize", phase1_categorize_node)
         workflow.add_node("search", search_node)
-        workflow.add_node("categorize", categorize_node)
-        
-        # Add edges
-        workflow.set_entry_point("search")
-        workflow.add_edge("search", "categorize")
-        workflow.add_edge("categorize", END)
-        
+        workflow.add_node("phase2_categorize", phase2_categorize_node)
+
+        workflow.set_entry_point("phase1_categorize")
+
+        workflow.add_conditional_edges(
+            "phase1_categorize",
+            should_search,
+            {"search": "search", "end": END}
+        )
+
+        workflow.add_edge("search", "phase2_categorize")
+        workflow.add_edge("phase2_categorize", END)
+
         return workflow.compile()
-    
-    def categorize_transaction(self, description: str, verbose: bool = False) -> Dict:
-        """Categorize a single transaction"""
-        
+
+    def categorize_transaction(
+        self,
+        transaction: Transaction,
+        verbose: bool = False
+    ) -> Transaction:
+        """
+        Categorize a transaction using rules engine + LLM.
+
+        Args:
+            transaction: Transaction object to categorize
+            verbose: Print details
+
+        Returns:
+            Same transaction object with categorization field populated
+        """
+        # Step 1: Try rules engine first
+        match_result = self.rules_engine.match_transaction(transaction)
+
+        if match_result.matched:
+            self.stats['rules_engine_hits'] += 1
+            if verbose:
+                print(f"✓ Rules engine match: {transaction.normalized_description}")
+                print(f"  Category: {match_result.rule.category}")
+                print(f"  Reason: {match_result.reason}")
+
+            transaction.categorization = CategorizationResult(
+                category=match_result.rule.category,
+                confidence=match_result.rule.confidence,
+                matched_rule=match_result.rule,
+                source=match_result.rule.rule_source,
+                reasoning=match_result.reason
+            )
+            return transaction
+
+        # Step 2: Run LLM agent
         if verbose:
-            print(f"🔍 Categorizing: {description}")
-        
-        # Initialize state
+            print(f"🔍 LLM Processing: {transaction.normalized_description}")
+
         initial_state: AgentState = {
-            "transaction_description": description,
-            "extracted_merchant": "",
+            "normalized_description": transaction.normalized_description,
+            "original_description": transaction.description,
+            "category": "",
+            "merchant": "",
+            "regex": "",
+            "confidence": 0.0,
+            "needs_search": False,
             "search_results": "",
             "reasoning": "",
-            "category": "",
-            "confidence": 0.0,
-            "explanation": "",
-            "messages": []
+            "phase": ""
         }
-        
-        # Run the agent
-        result = self.agent.invoke(initial_state)
-        
-        if verbose:
-            print(f"🎯 Result: {result['category']} (confidence: {result['confidence']:.1%})")
-            print(f"💭 Reasoning: {result['reasoning']}")
-        
-        return {
-            "transaction_description": description,
-            "extracted_merchant": result["extracted_merchant"],
-            "predicted_category": result["category"],
-            "confidence": result["confidence"],
-            "reasoning": result["reasoning"],
-            "search_results": result["search_results"],
-            "timestamp": datetime.now().isoformat()
-        }
-    
-    def categorize_batch(self, descriptions: List[str], verbose: bool = False) -> List[Dict]:
-        """Categorize multiple transactions"""
-        results = []
-        
-        for i, description in enumerate(descriptions):
-            if verbose:
-                print(f"\n--- Transaction {i+1}/{len(descriptions)} ---")
-            
-            result = self.categorize_transaction(description, verbose)
-            results.append(result)
-        
-        return results
 
-def display_results(results):
-    """
-    Display categorization results in a nicely formatted Rich table.
-    
-    Args:
-        results (list[dict]): Each dict should have keys:
-            - extracted_merchant
-            - predicted_category
-            - confidence (float)
-            - transaction_description
-    """
+        result = self.agent.invoke(initial_state)
+        self.stats['total_processed'] += 1
+
+        if verbose:
+            phase_label = f"PHASE {result.get('phase', '?')[-1]}"
+            print(f"  [{phase_label}] {result['category']} (conf: {result['confidence']:.1%})")
+            print(f"  Merchant: {result.get('merchant', 'N/A')}")
+            print(f"  Regex: {result.get('regex', 'N/A')}")
+
+        # Cache result if confident
+        if result['confidence'] >= 0.7 and result.get('regex'):
+            rule = CategorizationRule(
+                rule_type=RuleType.REGEX,
+                rule_source=RuleSource.AI_GENERATED,
+                pattern=result['regex'],
+                category=result['category'],
+                merchant_name=result.get('merchant', ''),
+                description=result.get('reasoning', ''),
+                confidence=result['confidence']
+            )
+            self.new_ai_rules.append(rule)
+
+        # Create categorization result
+        transaction.categorization = CategorizationResult(
+            category=result['category'],
+            confidence=result['confidence'],
+            matched_rule=None,  # No specific rule matched (LLM-generated)
+            source=RuleSource.AI_GENERATED,
+            reasoning=result.get('reasoning', '')
+        )
+
+        return transaction
+
+    def categorize_batch(
+        self,
+        transactions: List[Transaction],
+        verbose: bool = False
+    ) -> List[Transaction]:
+        """Categorize multiple transactions."""
+        if verbose:
+            with Progress() as progress:
+                task = progress.add_task("[cyan]Categorizing...", total=len(transactions))
+                for txn in transactions:
+                    self.categorize_transaction(txn, verbose=False)
+                    progress.update(task, advance=1)
+        else:
+            for txn in transactions:
+                self.categorize_transaction(txn, verbose=False)
+
+        return transactions
+
+    def save_ai_rules(self) -> None:
+        """Save newly generated AI rules to file."""
+        if not self.new_ai_rules:
+            print("No new AI rules to save")
+            return
+
+        # Merge with existing AI rules from rules engine
+        all_ai_rules = self.rules_engine.ai_rules + self.new_ai_rules
+
+        # Remove duplicates by pattern
+        unique_rules = {}
+        for rule in all_ai_rules:
+            unique_rules[rule.pattern] = rule
+
+        metadata = {
+            'total_rules': len(unique_rules),
+            'last_updated': datetime.now().isoformat(),
+            'stats': self.stats
+        }
+
+        save_history_rules(list(unique_rules.values()), self.ai_rules_file, metadata)
+        print(f"Saved {len(unique_rules)} AI rules to {self.ai_rules_file}")
+
+    def print_stats(self) -> None:
+        """Print categorization statistics."""
+        print("\n" + "="*60)
+        print("CATEGORIZATION STATISTICS")
+        print("="*60)
+        print(f"Total processed: {self.stats['total_processed']}")
+        print(f"Rules engine hits: {self.stats['rules_engine_hits']}")
+        print(f"Phase 1 success (no search): {self.stats['phase1_success']}")
+        print(f"Phase 2 (with search): {self.stats['phase2_search']}")
+
+        total = self.stats['total_processed'] + self.stats['rules_engine_hits']
+        if total > 0:
+            rules_rate = self.stats['rules_engine_hits'] / total * 100
+            search_rate = self.stats['phase2_search'] / self.stats['total_processed'] * 100 if self.stats['total_processed'] > 0 else 0
+
+            print(f"\nRules engine hit rate: {rules_rate:.1f}%")
+            print(f"Search rate: {search_rate:.1f}%")
+
+
+def display_results(transactions: List[Transaction]) -> None:
+    """Display categorization results."""
     console = Console()
     table = Table(show_header=True, header_style="bold magenta")
 
-    # overflow="fold" ensures long text wraps instead of truncating
-    table.add_column("Description", style="white", overflow="fold")
-    table.add_column("Merchant", style="cyan", no_wrap=True)
-    table.add_column("Category", style="green")
-    table.add_column("Confidence", style="yellow")
-    table.add_column("Reasoning", style="white", overflow="fold")
+    table.add_column("Description", style="white", max_width=25)
+    table.add_column("Category", style="green", max_width=25)
+    table.add_column("Conf", style="yellow")
+    table.add_column("Source", style="blue")
 
-    for result in results:
-        merchant = result.get("extracted_merchant", "")[:20]
-        category = result.get("predicted_category", "")[:40]
-        confidence = f"{result.get('confidence', 0.0):.1%}"
-        description = result.get("transaction_description", "")
-        reasoning = result.get('reasoning', "")
-        table.add_row(description, merchant, category, confidence, reasoning)
+    for txn in transactions:
+        desc = txn.normalized_description[:25]
+
+        if txn.categorization:
+            category = txn.categorization.category[:25]
+            confidence = f"{txn.categorization.confidence:.0%}"
+            source = txn.categorization.source.value if txn.categorization.source else "?"
+        else:
+            category = "Uncategorized"
+            confidence = "0%"
+            source = "N/A"
+
+        table.add_row(desc, category, confidence, source)
 
     console.print(table)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM-based transaction categorizer with internet search",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Categorize a single transaction
-  python llm_categorizer.py "Netflix.com 408-54037"
-  
-  # Categorize multiple transactions from a file
-  python llm_categorizer.py --file transactions.txt
-  
-  # Use verbose mode to see detailed reasoning
-  python llm_categorizer.py "STARBUCKS 12345 SAN DIEGO" --verbose
-  
-  # Save results to JSON file
-  python llm_categorizer.py "UBER TRIP" --output results.json
-
-Environment Variables Required:
-  OPENAI_API_KEY: Your OpenAI API key
-  TAVILY_API_KEY: Your Tavily search API key
-        """
+        description="LLM categorizer with rules engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
-    parser.add_argument('description', nargs='?', help='Transaction description to categorize')
-    parser.add_argument('--file', '-f', help='File containing transaction descriptions (one per line)')
-    parser.add_argument('--output', '-o', help='Output file for results (JSON format)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed reasoning')
-    
+
+    parser.add_argument('--description', '-d', help='Single description')
+    parser.add_argument('--file', '-f', help='File with descriptions (one per line)')
+    parser.add_argument('--categories', '-c', help='JSON file with categories')
+    parser.add_argument('--manual-rules', help='Manual rules YAML')
+    parser.add_argument('--history-rules', help='History rules YAML')
+    parser.add_argument('--ai-rules', '-a', default='ai_rules.yaml', help='AI rules YAML')
+    parser.add_argument('--no-history', action='store_true', help='Skip history rules')
+    parser.add_argument('--no-ai', action='store_true', help='Skip AI rules')
+    parser.add_argument('--output', '-o', help='Output JSON file')
+    parser.add_argument('--verbose', '-v', action='store_true')
+
     args = parser.parse_args()
-    
+
     if not args.description and not args.file:
-        parser.error("Must provide either a transaction description or a file with --file")
-    
-    # Check environment variables
+        parser.error("Must provide --description or --file")
+
     if not os.getenv("OPENAI_API_KEY"):
-        print("Error: OPENAI_API_KEY environment variable not set")
+        print("Error: OPENAI_API_KEY not set")
         sys.exit(1)
-    
-    if not os.getenv("TAVILY_API_KEY"):
-        print("Error: TAVILY_API_KEY environment variable not set")
-        print("Get a free API key at: https://tavily.com/")
-        sys.exit(1)
-    
+
+    # Initialize rules engine
+    rules_engine = RulesEngine(
+        manual_rules_file=args.manual_rules,
+        history_rules_file=args.history_rules,
+        ai_rules_file=args.ai_rules,
+        use_history=not args.no_history,
+        use_ai=not args.no_ai
+    )
+
     # Initialize categorizer
     try:
-        categorizer = LLMTransactionCategorizer()
+        categorizer = LLMTransactionCategorizer(
+            categories_file=args.categories,
+            rules_engine=rules_engine,
+            ai_rules_file=args.ai_rules
+        )
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
-    # Process transactions
+
+    # Process
     if args.description:
-        # Single transaction
-        result = categorizer.categorize_transaction(args.description, args.verbose)
-        
+        from datetime import date
+        from decimal import Decimal
+
+        normalized = normalize_description(args.description)
+
+        # Create Transaction object
+        txn = Transaction(
+            description=args.description,
+            normalized_description=normalized,
+            amount=Decimal("0.00"),  # Unknown amount for manual testing
+            date=date.today(),
+            transaction_type=TransactionType.DEBIT
+        )
+
+        categorizer.categorize_transaction(txn, verbose=args.verbose)
+
         if not args.verbose:
-            display_results([result])
-        
+            display_results([txn])
+
         if args.output:
+            output_data = {
+                "description": txn.description,
+                "normalized_description": txn.normalized_description,
+                "category": txn.categorization.category if txn.categorization else None,
+                "confidence": txn.categorization.confidence if txn.categorization else 0.0,
+                "source": txn.categorization.source.value if txn.categorization and txn.categorization.source else None,
+                "reasoning": txn.categorization.reasoning if txn.categorization else ""
+            }
             with open(args.output, 'w') as f:
-                json.dump(result, f, indent=2)
-            print(f"Results saved to {args.output}")
-    
+                json.dump(output_data, f, indent=2)
+
     elif args.file:
-        # Multiple transactions from file
+        from datetime import date
+        from decimal import Decimal
+
         if not Path(args.file).exists():
             print(f"Error: File not found: {args.file}")
             sys.exit(1)
-        
+
         with open(args.file, 'r') as f:
             descriptions = [line.strip() for line in f if line.strip()]
-        
-        if not descriptions:
-            print("Error: No transaction descriptions found in file")
-            sys.exit(1)
-        
-        print(f"Processing {len(descriptions)} transactions...")
-        results = categorizer.categorize_batch(descriptions, args.verbose)
-        
-        # Show summary table
+
+        # Create Transaction objects
+        transactions = []
+        for desc in descriptions:
+            normalized = normalize_description(desc)
+            txn = Transaction(
+                description=desc,
+                normalized_description=normalized,
+                amount=Decimal("0.00"),
+                date=date.today(),
+                transaction_type=TransactionType.DEBIT
+            )
+            transactions.append(txn)
+
+        print(f"Processing {len(transactions)} transactions...")
+        categorizer.categorize_batch(transactions, verbose=args.verbose)
+
         if not args.verbose:
-            display_results(results)
-        
+            display_results(transactions[:20])
+            if len(transactions) > 20:
+                print(f"\n... and {len(transactions) - 20} more")
+
         if args.output:
+            output_data = []
+            for txn in transactions:
+                output_data.append({
+                    "description": txn.description,
+                    "normalized_description": txn.normalized_description,
+                    "category": txn.categorization.category if txn.categorization else None,
+                    "confidence": txn.categorization.confidence if txn.categorization else 0.0,
+                    "source": txn.categorization.source.value if txn.categorization and txn.categorization.source else None,
+                    "reasoning": txn.categorization.reasoning if txn.categorization else ""
+                })
             with open(args.output, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"Results saved to {args.output}")
+                json.dump(output_data, f, indent=2)
+            print(f"\nResults saved to {args.output}")
+
+        # Save AI rules
+        categorizer.save_ai_rules()
+
+        # Print stats
+        categorizer.print_stats()
 
 
 if __name__ == "__main__":

@@ -11,14 +11,52 @@ This project provides multiple approaches to automatically categorize financial 
 3. **QFX file parsing** and transaction processing
 4. **Debugging and analysis tools** for fine-tuning
 
+### System Architecture
+
+The project follows a **layered, modular architecture** with type-safe data models:
+
+- **Core Models** (`core_models.py`): Dataclasses and enums for transactions, rules, and categorization results
+- **Rules Database** (`rules_db.py`): YAML-based rules management supporting multiple sources (manual, history-based, AI-generated)
+- **Analysis Tools**: Generate high-confidence rules from historical GNUCash data
+- **Categorization Engine**: Apply rules with fallback to LLM-based categorization
+- **Integration Layer**: Write categorized transactions back to GNUCash
+
+**Design Principles**:
+- Type safety using Python's `typing` module
+- Dataclasses for structured financial data
+- YAML format for human-readable, editable rules
+- Layered priority: Manual rules → History-based rules → AI-generated rules
+
 ## 📋 Table of Contents
 
 - [Installation](#installation)
+- [What's New](#whats-new)
 - [Tools Overview](#tools-overview)
 - [Quick Start Guide](#quick-start-guide)
 - [Tool Documentation](#tool-documentation)
 - [Workflow Examples](#workflow-examples)
 - [Configuration](#configuration)
+
+## ✨ What's New
+
+### Recent Refactoring (October 2025)
+
+The transaction analyzer has been **completely refactored** to align with the overall system architecture described in [design.md](design.md):
+
+**New Modules**:
+- `core_models.py`: Type-safe dataclasses for all financial entities
+- `rules_db.py`: YAML-based rules database with versioning support
+
+**Refactored `analyze_transactions.py`**:
+- ✅ **YAML output** instead of JSON (`history_rules.yaml`)
+- ✅ **DEBIT transactions only** - Credit transactions excluded (require manual handling)
+- ✅ **Higher confidence thresholds** - Default 65% (was 30%)
+- ✅ **Minimum pattern length** - 5+ characters to avoid trivial matches
+- ✅ **Removed merchant extraction** - Deferred to LLM agent with search capability
+- ✅ **Removed fuzzy matching** - Simplified to exact_match and contains rules
+- ✅ **Better coverage estimation** - Shows what % of transactions are covered
+
+**Philosophy**: Generate **fewer, higher-quality rules** since the LLM-based categorizer provides reliable fallback for uncovered transactions. This approach prioritizes precision over recall.
 
 ## 🚀 Installation
 
@@ -56,11 +94,19 @@ pip install langgraph langchain-openai langchain-tavily tavily-python rich
 
 | Tool | Purpose | Input | Output |
 |------|---------|-------|--------|
-| **analyze_transactions.py** | Generate categorization rules from GNUCash history | GNUCash file | JSON rules file |
+| **analyze_transactions.py** | Generate high-confidence categorization rules from GNUCash history | GNUCash file | YAML rules file |
 | **qfx_parser.py** | Parse QFX files and apply categorization rules | QFX file + rules | Categorized transactions |
 | **llm_categorizer.py** | AI-powered transaction categorization | Transaction descriptions | Intelligent categories |
 | **match_transaction.py** | Debug transaction matching against rules | Transaction description | Matching analysis |
 | **list_accounts.py** | List and analyze GNUCash account structure | GNUCash file | Account hierarchy |
+
+### Core Modules
+
+| Module | Purpose |
+|--------|---------|
+| **core_models.py** | Data models (dataclasses) for transactions, rules, and categorization |
+| **rules_db.py** | YAML-based rules database management and serialization |
+| **gnc_common.py** | Common GNUCash utilities and session management |
 
 ## 🚀 Quick Start Guide
 
@@ -111,13 +157,22 @@ export TAVILY_API_KEY="your-tavily-key"
 
 ### 🔍 analyze_transactions.py
 
-**Purpose**: Analyzes historical GNUCash transactions to generate intelligent categorization rules.
+**Purpose**: Analyzes historical GNUCash transactions to generate high-confidence categorization rules.
+
+**Design Philosophy**:
+- Generates **fewer, higher-quality rules** since LLM-based categorization provides a reliable fallback
+- Focuses on **DEBIT transactions only** (expenses); credit transactions require manual handling
+- Uses **conservative thresholds** to avoid false positives
 
 **Features**:
-- Extracts transactions from credit card accounts
-- Analyzes merchant patterns using multiple techniques
-- Generates rules with confidence scores
-- Supports fuzzy matching and word analysis
+- Extracts debit transactions from credit card accounts
+- Normalizes descriptions for pattern matching
+- Generates two types of rules:
+  - **exact_match**: For exact normalized description matches
+  - **contains**: For high-frequency word patterns
+- Higher confidence thresholds (default 65% vs legacy 30%)
+- Minimum pattern length enforcement (5+ characters)
+- Comprehensive coverage estimation
 
 **Usage**:
 ```bash
@@ -125,14 +180,33 @@ export TAVILY_API_KEY="your-tavily-key"
 
 Options:
   --config, -c     YAML configuration file
-  --output, -o     Output JSON file (default: categorization_rules.json)
+  --output, -o     Output YAML file (default: history_rules.yaml)
 ```
 
-**Output**: JSON file with categorization rules including:
-- Merchant-based rules
-- Fuzzy merchant matching
-- Description pattern rules
-- Confidence scores and transaction counts
+**Output**: YAML file (`history_rules.yaml`) with:
+- High-confidence categorization rules
+- Rule metadata (confidence, transaction counts, examples)
+- Generation metadata (config, date range, coverage stats)
+- Version information for future compatibility
+
+**Example Output Structure**:
+```yaml
+version: '1.0'
+description: Rules generated from historical GNUCash data
+metadata:
+  total_transactions_analyzed: 10469
+  total_rules_generated: 103
+  generation_config:
+    minimum_transactions: 3
+    confidence_threshold: 0.65
+    min_pattern_length: 5
+rules:
+  - rule_type: contains
+    pattern: netflix
+    category: Expenses.Bills.Streaming Services
+    confidence: 0.95
+    transaction_count: 48
+```
 
 ### 📄 qfx_parser.py
 
@@ -298,18 +372,20 @@ Configure which accounts to analyze:
 
 ```yaml
 credit_card_accounts:
-  - "Liabilities:Credit Cards:Chase"
-  - "Liabilities:Credit Cards:Amex"
+  - "Credit Cards: Citi Costco Visa"
+  - "Credit Cards: Fidelity Visa"
 
 date_range:
-  start_date: "2023-01-01"
-  end_date: "2024-12-31"
+  start_date: "2023-01-01"  # Optional
+  end_date: "2024-12-31"    # Optional
 
 rule_settings:
-  minimum_transactions: 2
-  confidence_threshold: 0.3
-  fuzzy_similarity: 0.8
+  minimum_transactions: 3      # Minimum transactions to create a rule (default: 3)
+  confidence_threshold: 0.65   # Minimum confidence (0.0-1.0, default: 0.65)
+  min_pattern_length: 5        # Minimum pattern length in chars (default: 5)
 ```
+
+**Note**: The refactored `analyze_transactions.py` uses higher default thresholds since LLM-based categorization provides fallback support for uncovered transactions.
 
 ### Environment Variables
 
@@ -331,6 +407,26 @@ export OPENAI_MODEL="gpt-4o-mini"
 - **Continuous improvement** through new rule suggestions
 - **Cost effective** (~$0.01-0.02 per transaction with LLM)
 
+## 📁 Project Structure
+
+```
+gnc_utils/
+├── core_models.py              # Data models (transactions, rules, enums)
+├── rules_db.py                 # YAML rules database management
+├── gnc_common.py               # Common GNUCash utilities
+├── analyze_transactions.py     # Generate rules from history
+├── qfx_parser.py              # Parse QFX files
+├── llm_categorizer.py         # AI-powered categorization
+├── match_transaction.py       # Debug tool for rules
+├── list_accounts.py           # List GNUCash accounts
+├── design.md                  # System design document
+├── functional-specs.md        # Functional specifications
+├── history_rules.yaml         # Generated history-based rules
+├── manual_rules.yaml          # User-defined manual rules (optional)
+├── ai_rules.yaml             # AI-generated rules (optional)
+└── analyze_config.yaml        # Analyzer configuration
+```
+
 ## 🔧 Troubleshooting
 
 ### Common Issues
@@ -339,12 +435,15 @@ export OPENAI_MODEL="gpt-4o-mini"
 2. **API key errors**: Verify environment variables are set correctly
 3. **Library errors**: Install missing dependencies with `pip install <package>`
 4. **Permission errors**: Check file permissions for GNUCash files
+5. **Long processing time**: The analyzer can take several minutes on large GNUCash files (set timeout appropriately)
 
 ### Debug Tools
 
 - Use `match_transaction.py` to understand rule matching
 - Use `--verbose` flags for detailed processing information
-- Check generated JSON outputs for data validation
+- Check generated YAML rule files for validation
+- Inspect `test_history_rules.yaml` to understand rule structure
+- Review coverage statistics in analyzer output to tune thresholds
 
 ## 📝 License
 
